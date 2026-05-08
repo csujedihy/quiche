@@ -977,6 +977,7 @@ pub struct Connection {
 
     max_push_id: u64,
 
+    // Streams that received FIN from the peer
     finished_streams: VecDeque<u64>,
 
     frames_greased: bool,
@@ -1498,6 +1499,9 @@ impl Connection {
 
         if let Some(s) = self.streams.get_mut(&stream_id) {
             s.initialize_local();
+            if fin {
+                s.mark_local_fin();
+            }
         }
 
         if fin && conn.stream_finished(stream_id) {
@@ -1743,8 +1747,14 @@ impl Connection {
             let _ = conn.stream_writable(stream_id, overhead + 1);
         }
 
-        if fin && written == len && conn.stream_finished(stream_id) {
-            self.streams.remove(&stream_id);
+        if fin && written == len {
+            if let Some(s) = self.streams.get_mut(&stream_id) {
+                s.mark_local_fin();
+            }
+
+            if conn.stream_finished(stream_id) {
+                self.streams.remove(&stream_id);
+            }
         }
 
         Ok(ret)
@@ -2098,6 +2108,11 @@ impl Connection {
 
         // Process finished streams list.
         if let Some(finished) = self.finished_streams.pop_front() {
+            // We need to check if we should remove this stream from the stream map.
+            // We should only do it if the local side has sent FIN as well though.
+            if self.streams.get(&finished).is_some_and(|s| s.local_fin()) {
+                self.streams.remove(&finished);
+            }
             return Ok((finished, Event::Finished));
         }
 
@@ -2122,7 +2137,6 @@ impl Connection {
                 self.process_finished_stream(s);
             }
 
-            // TODO: check if stream is completed so it can be freed
             if let Some(ev) = ev {
                 return Ok(ev);
             }
@@ -2132,14 +2146,24 @@ impl Connection {
         // events are returned when receiving empty stream frames with the fin
         // flag set.
         if let Some(finished) = self.finished_streams.pop_front() {
+            // Store whether this stream (if found) has also sent FIN.
+            let release =
+                self.streams.get(&finished).is_some_and(|s| s.local_fin());
+
             if conn.stream_readable(finished) {
                 // The stream is finished, but is still readable, it may
                 // indicate that there is a pending error, such as reset.
                 if let Err(crate::Error::StreamReset(e)) =
                     conn.stream_recv(finished, &mut [])
                 {
+                    if release {
+                        self.streams.remove(&finished);
+                    }
                     return Ok((finished, Event::Reset(e)));
                 }
+            }
+            if release {
+                self.streams.remove(&finished);
             }
             return Ok((finished, Event::Finished));
         }
@@ -3787,6 +3811,113 @@ mod tests {
 
         assert_eq!(s.poll_client(), Ok((stream, Event::Finished)));
         assert_eq!(s.poll_client(), Err(Error::Done));
+    }
+
+    #[test]
+    /// Verify that the H3 stream map does not leak entries across many
+    /// completed request/response exchanges on a single connection.
+    ///
+    /// The H3 stream object on both sides must be removed once
+    /// `Event::Finished` is delivered. Otherwise the map grows
+    /// without bound for the lifetime of the connection.
+    fn request_response_stream_map_does_not_leak() {
+        let mut s = Session::new().unwrap();
+        s.handshake().unwrap();
+
+        // Snapshot the initial map sizes after handshake.
+        let client_baseline = s.client.streams.len();
+        let server_baseline = s.server.streams.len();
+
+        for _ in 0..32 {
+            let (stream, req) = s.send_request(true).unwrap();
+
+            let ev_headers = Event::Headers {
+                list: req,
+                more_frames: false,
+            };
+            assert_eq!(s.poll_server(), Ok((stream, ev_headers)));
+            assert_eq!(s.poll_server(), Ok((stream, Event::Finished)));
+            assert_eq!(s.poll_server(), Err(Error::Done));
+
+            let resp = s.send_response(stream, true).unwrap();
+
+            let ev_headers = Event::Headers {
+                list: resp,
+                more_frames: false,
+            };
+            assert_eq!(s.poll_client(), Ok((stream, ev_headers)));
+            assert_eq!(s.poll_client(), Ok((stream, Event::Finished)));
+            assert_eq!(s.poll_client(), Err(Error::Done));
+
+            // The request stream must be evicted from both peers' H3
+            // stream maps after the terminal `Event::Finished` is
+            // delivered.
+            assert!(
+                !s.client.streams.contains_key(&stream),
+                "client H3 stream map leaked stream {stream}"
+            );
+            assert!(
+                !s.server.streams.contains_key(&stream),
+                "server H3 stream map leaked stream {stream}"
+            );
+        }
+
+        // The map size must not have grown beyond the post-handshake
+        // baseline despite 32 completed request/response cycles.
+        assert_eq!(s.client.streams.len(), client_baseline);
+        assert_eq!(s.server.streams.len(), server_baseline);
+    }
+
+    #[test]
+    /// Similar to `request_response_stream_map_does_not_leak` but
+    /// headers first (without FIN) and then body (with FIN).
+    fn request_with_body_stream_map_does_not_leak() {
+        let mut s = Session::new().unwrap();
+        s.handshake().unwrap();
+
+        // Snapshot the initial map sizes after handshake.
+        let client_baseline = s.client.streams.len();
+        let server_baseline = s.server.streams.len();
+
+        let (stream, req) = s.send_request(false).unwrap();
+
+        let ev_headers = Event::Headers {
+            list: req,
+            more_frames: true,
+        };
+        assert_eq!(s.poll_server(), Ok((stream, ev_headers)));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        // Client sends body with FIN.
+        let body = s.send_body_client(stream, true).unwrap();
+
+        let mut recv_buf = vec![0; body.len()];
+        assert_eq!(s.poll_server(), Ok((stream, Event::Data)));
+        assert_eq!(s.recv_body_server(stream, &mut recv_buf), Ok(body.len()));
+        assert_eq!(s.poll_server(), Ok((stream, Event::Finished)));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        // Server responds with FIN.
+        let resp = s.send_response(stream, true).unwrap();
+
+        let ev_headers = Event::Headers {
+            list: resp,
+            more_frames: false,
+        };
+        assert_eq!(s.poll_client(), Ok((stream, ev_headers)));
+        assert_eq!(s.poll_client(), Ok((stream, Event::Finished)));
+        assert_eq!(s.poll_client(), Err(Error::Done));
+
+        assert!(
+            !s.client.streams.contains_key(&stream),
+            "client H3 stream map leaked stream {stream}"
+        );
+        assert!(
+            !s.server.streams.contains_key(&stream),
+            "server H3 stream map leaked stream {stream}"
+        );
+        assert_eq!(s.client.streams.len(), client_baseline);
+        assert_eq!(s.server.streams.len(), server_baseline);
     }
 
     #[test]

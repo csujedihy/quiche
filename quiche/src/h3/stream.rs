@@ -153,6 +153,9 @@ pub struct Stream {
     /// Whether the stream has been locally initialized.
     local_initialized: bool,
 
+    /// Whether the local side has sent its FIN on this stream.
+    local_fin: bool,
+
     /// Whether a `Data` event has been triggered for this stream.
     data_event_triggered: bool,
 
@@ -206,6 +209,7 @@ impl Stream {
             is_local,
             remote_initialized: false,
             local_initialized: false,
+            local_fin: false,
 
             data_event_triggered: false,
 
@@ -516,6 +520,16 @@ impl Stream {
     /// Whether the stream has been locally initialized.
     pub fn local_initialized(&self) -> bool {
         self.local_initialized
+    }
+
+    /// Mark the local side of the stream as having sent FIN.
+    pub fn mark_local_fin(&mut self) {
+        self.local_fin = true;
+    }
+
+    /// Whether the local side of the stream has sent FIN.
+    pub fn local_fin(&self) -> bool {
+        self.local_fin
     }
 
     pub fn increment_headers_received(&mut self) {
