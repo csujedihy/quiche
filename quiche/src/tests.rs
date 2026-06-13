@@ -1013,6 +1013,61 @@ fn streamio(#[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str) {
     assert!(pipe.server.stream_finished(4));
 }
 
+#[rstest]
+fn stream_closed_bidi(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert!(!pipe.client.stream_closed(0));
+    assert!(!pipe.server.stream_closed(0));
+
+    assert_eq!(pipe.client.stream_send(0, b"hello", true), Ok(5));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    assert!(!pipe.client.stream_closed(0));
+    assert!(!pipe.server.stream_closed(0));
+
+    let mut buf = [0; 5];
+    assert_eq!(pipe.server.stream_recv(0, &mut buf), Ok((5, true)));
+
+    assert!(!pipe.server.stream_closed(0));
+
+    assert_eq!(pipe.server.stream_send(0, b"world", true), Ok(5));
+    assert!(pipe.server.stream_closed(0));
+
+    assert_eq!(pipe.advance(), Ok(()));
+
+    assert!(!pipe.client.stream_closed(0));
+    assert_eq!(pipe.client.stream_recv(0, &mut buf), Ok((5, true)));
+    assert!(pipe.client.stream_closed(0));
+}
+
+#[rstest]
+fn stream_closed_uni(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert!(!pipe.client.stream_closed(2));
+    assert!(!pipe.server.stream_closed(2));
+
+    assert_eq!(pipe.client.stream_send(2, b"hello", true), Ok(5));
+
+    assert!(pipe.client.stream_closed(2));
+
+    assert_eq!(pipe.advance(), Ok(()));
+
+    assert!(!pipe.server.stream_closed(2));
+
+    let mut buf = [0; 5];
+    assert_eq!(pipe.server.stream_recv(2, &mut buf), Ok((5, true)));
+
+    assert!(pipe.server.stream_closed(2));
+}
+
 /// Test receiving into `BufMut`
 #[rstest]
 fn stream_recv_buf(
@@ -10198,6 +10253,42 @@ fn connection_id_retire_limit(
 }
 
 #[rstest]
+fn avoid_scids_left_underflow_during_rotation(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    // Default active_conn_id_limit is 2, sufficient to trigger the rotation.
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // Fill up to the advertised limit.
+    let (scid_1, token_1) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(pipe.client.new_scid(&scid_1, token_1, false), Ok(1));
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(pipe.client.scids_left(), 0);
+
+    // Issue a new SCID with retire_prior_to=true. This forces a rotation:
+    // the client now holds 3 SCIDs internally (seq 0 retiring, seq 1, seq 2)
+    // while the advertised limit is still 2. active_scids() = 3,
+    // max_active_source_cids = 2 => underflow.
+    let (scid_2, token_2) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(pipe.client.new_scid(&scid_2, token_2, true), Ok(2));
+
+    // Before advancing (retirement not yet acknowledged), active_scids()
+    // exceeds the advertised limit. scids_left() should return 0.
+    let active = pipe.client.active_scids();
+    let left = pipe.client.scids_left();
+
+    assert!(
+        active > 2,
+        "expected active_scids ({active}) > limit (2) during rotation"
+    );
+    assert_eq!(
+        left, 0,
+        "scids_left() should be 0 during rotation but returned {left}"
+    );
+}
+
+#[rstest]
 fn connection_id_retire_exotic_sequence(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
     #[values(true, false)] discard: bool,
@@ -12224,7 +12315,7 @@ fn disable_pmtud_mid_handshake(
 }
 
 #[rstest]
-fn configuration_values_are_limited_to_max_varint() {
+fn configuration_values_clamping() {
     let mut config = Config::new(0x1).unwrap();
     config
         .set_application_protos(&[b"proto1", b"proto2"])
@@ -12285,7 +12376,7 @@ fn configuration_values_are_limited_to_max_varint() {
     );
     assert_eq!(
         pipe.client.local_transport_params.ack_delay_exponent,
-        octets::MAX_VAR_INT
+        MAX_ACK_DELAY_EXPONENT
     );
     assert_eq!(
         pipe.client.local_transport_params.active_conn_id_limit,
