@@ -46,6 +46,8 @@ use self::congestion::recovery::LegacyRecovery;
 use self::gcongestion::GRecovery;
 pub use gcongestion::BbrBwLoReductionStrategy;
 pub use gcongestion::BbrParams;
+#[cfg(feature = "internal")]
+pub use gcongestion::BbrRttJumpDetector;
 
 // Loss Recovery
 const INITIAL_PACKET_THRESHOLD: u64 = 3;
@@ -93,11 +95,6 @@ const LOSS_REDUCTION_FACTOR: f64 = 0.5;
 // How many non ACK eliciting packets we send before including a PING to solicit
 // an ACK.
 pub(super) const MAX_OUTSTANDING_NON_ACK_ELICITING: usize = 24;
-
-// The upper cap on the exponent when using exponential backoff for probes. With
-// a value of 20, the maximum possible value is 2^20 = 1,048,576 times the
-// minimum PTO. This prevents arithmetic overflow.
-const MAX_PTO_EXPONENT: u32 = 20;
 
 #[derive(Default)]
 struct LossDetectionTimer {
@@ -253,6 +250,9 @@ pub trait RecoveryOps {
 
     /// Maximum bandwidth estimate, if one is available.
     fn max_bandwidth(&self) -> Option<Bandwidth>;
+
+    /// Total number of confirmed persistent RTT jump episodes.
+    fn rtt_persistent_jump_count(&self) -> u64;
 
     /// Statistics from when a CCA first exited the startup phase.
     fn startup_exit(&self) -> Option<StartupExit>;
